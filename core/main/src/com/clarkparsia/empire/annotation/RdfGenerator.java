@@ -423,13 +423,16 @@ public final class RdfGenerator {
 
 			addNamespaces(theObj.getClass());
 
-			final Map<URI, AccessibleObject> aAccessMap = new HashMap<URI, AccessibleObject>();
+			final Map<URI, Set<AccessibleObject>> aAccessMap = new HashMap<URI, Set<AccessibleObject>>();
 
 			Iterables2.each(aFields, new Predicate<Field>() {
 				public boolean apply(final Field theField) {
 					if (theField.getAnnotation(RdfProperty.class) != null) {
-						aAccessMap.put(FACTORY.createURI(PrefixMapping.GLOBAL.uri(theField.getAnnotation(RdfProperty.class).value())),
-									   theField);
+						URI aURI = FACTORY.createURI(PrefixMapping.GLOBAL.uri(theField.getAnnotation(RdfProperty.class).value()));
+						if (!aAccessMap.containsKey(aURI)) {
+							aAccessMap.put(aURI, new HashSet<AccessibleObject>());
+						}
+						aAccessMap.get(aURI).add(theField);
 					}
 					else {
 						String aBase = "urn:empire:clark-parsia:";
@@ -437,8 +440,12 @@ public final class RdfGenerator {
 							aBase = ((URI)aRes).getNamespace();
 						}
 
-						aAccessMap.put(FACTORY.createURI(aBase + theField.getName()),
-									   theField);
+						URI aURI = FACTORY.createURI(aBase + theField.getName());
+						if (!aAccessMap.containsKey(aURI)) {
+							aAccessMap.put(aURI, new HashSet<AccessibleObject>());
+						}
+
+						aAccessMap.get(aURI).add(theField);
 					}
 
 					return true;
@@ -449,8 +456,12 @@ public final class RdfGenerator {
 				public boolean apply(final Method theMethod) {
 					RdfProperty aAnnotation = BeanReflectUtil.getAnnotation(theMethod, RdfProperty.class);
 					if (aAnnotation != null) {
-						aAccessMap.put(FACTORY.createURI(PrefixMapping.GLOBAL.uri(aAnnotation.value())),
-									   theMethod);
+						URI aURI = FACTORY.createURI(PrefixMapping.GLOBAL.uri(aAnnotation.value()));
+						if (!aAccessMap.containsKey(aURI)) {
+							aAccessMap.put(aURI, new HashSet<AccessibleObject>());
+						}
+
+						aAccessMap.get(aURI).add(theMethod);
 					}
 
 					return true;
@@ -458,83 +469,53 @@ public final class RdfGenerator {
 			});			
 			
 			Set<URI> aUsedProps = new HashSet<URI>();
-
 			for (URI aProp : aProps) {
-				AccessibleObject aAccess = aAccessMap.get(aProp);
+				Set<AccessibleObject> aObjectList = aAccessMap.get(aProp);
 
-				if (aAccess == null && RDF.TYPE.equals(aProp)) {
-					// TODO: the following block should be entirely removed (leaving continue only)
-					// right now, leaving it until the code review: code review before removing the following block
-					
-					// my understanding is that the following block was only necessary when having a support for a single-typed objects,
-					// which is no longer the case 					
-					
-					// we can skip the rdf:type property.  it's basically assigned in the @RdfsClass annotation on the
-					// java class, so we can figure it out later if need be. TODO: of course, if something has multiple types
-					// that information is lost, which is not good.
+				if (aObjectList == null) {
+					continue;
+				}
 
-					
-					/*
-					URI aType = (URI) aGraph.getValue(aRes, aProp);
-					if (!TYPE_TO_CLASS.containsKey(aType) ||
-						!TYPE_TO_CLASS.get(aType).isAssignableFrom(theObj.getClass())) {
+				for (AccessibleObject aAccess : aAccessMap.get(aProp)) {
+					aUsedProps.add(aProp);
 
-						if (TYPE_TO_CLASS.containsKey(aType) && !TYPE_TO_CLASS.get(aType).getName().equals(theObj.getClass().getName())) {
-							// TODO: this might just be an error
-							LOGGER.warn("Asserted rdf:type of the individual does not match the rdf:type annotation on the object. " + aType + " " + TYPE_TO_CLASS.get(aType) + " " + theObj.getClass() + " " +TYPE_TO_CLASS.get(aType).isAssignableFrom(theObj.getClass())+ " " +TYPE_TO_CLASS.get(aType).equals(theObj.getClass()) + " " + TYPE_TO_CLASS.get(aType).getName().equals(theObj.getClass().getName()));
-						}
-						else {
-							// if they're not equals() or isAssignableFrom, but have the same name, this is usually
-							// means that the class loaders don't match.  so probably not an error, so no warning.
-						}
+					ToObjectFunction aFunc = new ToObjectFunction(theSource, aRes, aAccess, aProp);
+
+					Object aValue = aFunc.apply(GraphUtil.getObjects(aGraph, aRes, aProp));
+
+					boolean aOldAccess = aAccess.isAccessible();
+
+					try {
+						setAccessible(aAccess, true);
+						set(aAccess, theObj, aValue);
 					}
-					*/
+					catch (InvocationTargetException e) {
+						// oh crap
+						throw new InvalidRdfException(e);
+					}
+					catch (IllegalAccessException e) {
+						// this should not happen since we toggle the accessibility of the field, but we'll re-throw regardless
+						throw new InvalidRdfException(e);
+					}
+					catch (IllegalArgumentException e) {
+						// this is "likely" to happen.  we'll get this exception if the rdf does not match the java.  for example
+						// if something is specified to be an int in the java class, but it typed as a float (though down conversion
+						// in that case might work) the set call will fail.
+						// TODO: shouldnt this be an error?
 
-					continue;
-				}
-				else if (aAccess == null) {
-					// this must be data that is not covered by the bean (perhaps accessible by a different view/bean for a differnent type of an individual)					
-					continue;
-				}
+						LOGGER.warn("Probable type mismatch: {} {}", aValue, aAccess);
+					}
+					catch (RuntimeException e) {
+						// TODO: i dont like keying on a RuntimeException here to get the error condition, but since the
+						// Function interface does not throw anything, this is the best we can do.  maybe consider a
+						// version of the Function interface that has a throws clause, it would make this more clear.
 
-				aUsedProps.add(aProp);
-				
-				ToObjectFunction aFunc = new ToObjectFunction(theSource, aRes, aAccess, aProp);
-
-				Object aValue = aFunc.apply(GraphUtil.getObjects(aGraph, aRes, aProp));
-
-				boolean aOldAccess = aAccess.isAccessible();
-
-				try {
-					setAccessible(aAccess, true);					
-					set(aAccess, theObj, aValue);				
-				}				
-				catch (InvocationTargetException e) {
-					// oh crap
-					throw new InvalidRdfException(e);
-				}
-				catch (IllegalAccessException e) {
-					// this should not happen since we toggle the accessibility of the field, but we'll re-throw regardless
-					throw new InvalidRdfException(e);
-				}
-				catch (IllegalArgumentException e) {
-					// this is "likely" to happen.  we'll get this exception if the rdf does not match the java.  for example
-					// if something is specified to be an int in the java class, but it typed as a float (though down conversion
-					// in that case might work) the set call will fail.
-					// TODO: shouldnt this be an error?
-
-					LOGGER.warn("Probable type mismatch: {} {}", aValue, aAccess);
-				}
-				catch (RuntimeException e) {
-					// TODO: i dont like keying on a RuntimeException here to get the error condition, but since the
-					// Function interface does not throw anything, this is the best we can do.  maybe consider a
-					// version of the Function interface that has a throws clause, it would make this more clear.
-
-					// this was probably an error converting from a Value to an Object
-					throw new InvalidRdfException(e);
-				}
-				finally {
-					setAccessible(aAccess, aOldAccess);
+						// this was probably an error converting from a Value to an Object
+						throw new InvalidRdfException(e);
+					}
+					finally {
+						setAccessible(aAccess, aOldAccess);
+					}
 				}
 			}
 			
@@ -1021,6 +1002,9 @@ public final class RdfGenerator {
 				else {
 					LANG_FILTER.setLangCode(mField.getAnnotation(RdfProperty.class).language());
 					aList = Collections2.filter(aList, LANG_FILTER);
+					if (aList.isEmpty()) {
+						return null;
+					}
 				}
 			}
 
@@ -1575,7 +1559,7 @@ public final class RdfGenerator {
 		}
 
 		public boolean apply(final Value theValue) {
-			return theValue instanceof Literal && mLangCode.equals(((Literal)theValue).getLanguage());
+			return theValue instanceof Literal && (mLangCode == null && ((Literal)theValue).getLanguage() == null || mLangCode.equals(((Literal)theValue).getLanguage()));
 		}
 	}
 }
